@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>实时字幕 Overlay</title>
+    <link rel="stylesheet" href="/static/style.css?v=2" />
+  </head>
+  <body>
+    <div class="overlay-root" id="overlayRoot">
+      <div class="chrome">
+        <div class="chrome-row">
+          <div class="pill" title="连接状态">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">未连接</span>
+          </div>
+          <div class="pill">
+            <select id="providerSelect" aria-label="ASR 模型">
+              <option value="qwen-sf" selected>Qwen3-ASR-1.7B</option>
+              <option value="sensevoice">SenseVoiceSmall</option>
+              <option value="mock">Mock 演示</option>
+            </select>
+          </div>
+          <div class="pill">
+            <select id="langSelect" aria-label="语言">
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+              <option value="auto" selected>自动</option>
+            </select>
+          </div>
+          <button type="button" class="btn-ghost" id="btnClear">清空</button>
+          <button type="button" class="btn-mic" id="btnMic" aria-label="开始或停止麦克风" title="开始 / 停止">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="error-banner" id="errorBanner" role="alert"></div>
+      </div>
+
+      <div class="history-panel" id="historyPanel" aria-live="polite"></div>
+
+      <div class="subtitle-bar">
+        <div class="subtitle-text" id="subtitleText" aria-live="assertive"></div>
+        <div class="hint">半透明字幕条 · 可将浏览器窗口叠在视频上使用</div>
+      </div>
+    </div>
+    <script src="/static/app.js?v=3"></script>
+  </body>
+</html>

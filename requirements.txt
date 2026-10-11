@@ -1,0 +1,9 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+numpy>=1.24.0
+PyQt5>=5.15.0
+sounddevice>=0.4.6
+PyAudioWPatch>=0.2.12.6; platform_system=="Windows"
+SoundCard>=0.4.2
