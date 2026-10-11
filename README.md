@@ -1,6 +1,6 @@
 # 实时 ASR 字幕 Overlay
 
-本地迷你应用：提供 **PyQt5 桌面置顶字幕 HUD**（推荐）和可选浏览器半透明页。默认捕获**系统播放声音**（视频/浏览器），PCM 在进程内打包为 16 kHz 单声道 WAV，调用**硅基流动（SiliconFlow）云端 ASR**，**不依赖 ffmpeg，不下载本地大模型**。
+本地迷你应用：提供 **PyQt5 桌面置顶字幕 HUD**（推荐）和可选浏览器半透明页。默认捕获**系统播放声音**（视频/浏览器），PCM 在进程内打包为 16 kHz 单声道 WAV，调用**硅基流动（[SiliconFlow](https://cloud.siliconflow.cn/i/Cvmvkm5d)）云端 ASR**，**不依赖 ffmpeg，不下载本地大模型**。
 
 ## Screenshots
 
@@ -37,7 +37,7 @@ copy .env.example .env
 python desktop_overlay.py
 ```
 
-申请 API Key：[硅基流动控制台](https://cloud.siliconflow.cn)
+申请 API Key：[硅基流动控制台](https://cloud.siliconflow.cn/i/Cvmvkm5d)
 
 ### 桌面 Overlay 功能
 
