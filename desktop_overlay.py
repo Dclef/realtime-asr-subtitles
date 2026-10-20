@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 import numpy as np
 from dotenv import load_dotenv
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QFont, QColor, QPainter, QBrush, QPen, QMouseEvent
 from PyQt5.QtWidgets import (
     QApplication,
@@ -92,12 +92,16 @@ LOOPBACK_NAME_HINTS = (
 
 NO_LOOPBACK_HELP = (
     "未检测到系统声音回环设备，无法字幕浏览器/视频播放音频。\n\n"
+    "插拔耳机后请先点「刷新设备」——程序会按当前默认播放设备"
+    "（扬声器/耳机）重新枚举 WASAPI 回环。\n\n"
     "请任选其一：\n"
-    "1) 启用「立体声混音」：右键任务栏喇叭 → 声音设置 → 更多声音设置 → "
+    "1) 确认耳机已成为 Windows 默认播放设备后点「刷新设备」；\n"
+    "2) 启用「立体声混音」：右键任务栏喇叭 → 声音设置 → 更多声音设置 → "
     "「录制」选项卡 → 右键空白处勾选「显示禁用的设备」→ 启用「立体声混音」；\n"
-    "2) 安装 VB-Audio Virtual Cable（https://vb-audio.com/Cable/），"
+    "3) 部分 USB/蓝牙耳机没有可用回环：可改回板载扬声器/3.5mm 耳机，"
+    "或安装 VB-Audio Virtual Cable（https://vb-audio.com/Cable/）"
     "并将系统/浏览器输出设为 CABLE Input；\n"
-    "3) 本程序会优先用 WASAPI Loopback（无需立体声混音）。"
+    "4) 本程序优先用当前默认播放设备的 WASAPI Loopback（无需立体声混音）。"
     "若仍失败，请更新声卡驱动后重试。\n\n"
     "也可临时切换到「麦克风」模式听写人声。"
 )
@@ -260,6 +264,23 @@ def _name_looks_loopback(name: str) -> bool:
     return any(h in low for h in LOOPBACK_NAME_HINTS)
 
 
+def _strip_loopback_suffix(name: str) -> str:
+    """'Speakers (Realtek) [Loopback]' → 'Speakers (Realtek)'."""
+    n = (name or "").strip()
+    for suf in (" [Loopback]", " (Loopback)", " [loopback]"):
+        if n.endswith(suf):
+            return n[: -len(suf)].strip()
+    return n
+
+
+def _names_match_output(loopback_name: str, output_name: str) -> bool:
+    if not loopback_name or not output_name:
+        return False
+    lb = _strip_loopback_suffix(loopback_name)
+    out = (output_name or "").strip()
+    return lb == out or out in lb or lb in out
+
+
 # ---------------------------------------------------------------------------
 # Audio device discovery
 # ---------------------------------------------------------------------------
@@ -274,14 +295,77 @@ class AudioDevice:
     kind: str  # "loopback" | "mic"
     backend: str  # "pyaudiowpatch" | "soundcard" | "sounddevice"
     backend_ref: object  # backend-specific handle / index
+    device_name: str = ""  # raw endpoint name (for re-resolve after plug)
+
+
+def current_default_playback_name() -> str:
+    """Best-effort name of the current default WASAPI / system playback device."""
+    try:
+        import pyaudiowpatch as pyaudio
+
+        p = pyaudio.PyAudio()
+        try:
+            try:
+                info = p.get_default_wasapi_device(d_out=True)
+                return (info.get("name") or "").strip()
+            except Exception:
+                wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                di = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+                return (di.get("name") or "").strip()
+        finally:
+            p.terminate()
+    except Exception:
+        pass
+    try:
+        import soundcard as sc
+
+        return (sc.default_speaker().name or "").strip()
+    except Exception:
+        return ""
+
+
+def _add_loopback(
+    loopbacks: list[AudioDevice],
+    seen_lb: set[str],
+    *,
+    key: str,
+    name: str,
+    label: str,
+    backend: str,
+    backend_ref: object,
+    default_out_name: str,
+) -> None:
+    if key in seen_lb:
+        return
+    # Deduplicate by stripped endpoint name across backends
+    bare = _strip_loopback_suffix(name).lower()
+    if bare and any(_strip_loopback_suffix(d.device_name).lower() == bare for d in loopbacks):
+        return
+    seen_lb.add(key)
+    score_prefix = "★ " if _names_match_output(name, default_out_name) else ""
+    loopbacks.append(
+        AudioDevice(
+            key=key,
+            label=f"{score_prefix}{label}",
+            kind="loopback",
+            backend=backend,
+            backend_ref=backend_ref,
+            device_name=name,
+        )
+    )
 
 
 def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
-    """Return (loopback_devices, mic_devices). Prefer WASAPI loopback."""
+    """Return (loopback_devices, mic_devices).
+
+    Prefer WASAPI loopback of the *current default playback device* (speakers or
+    headphones). Re-enumerate every call so「刷新设备」/plug-in picks up changes.
+    """
     loopbacks: list[AudioDevice] = []
     mics: list[AudioDevice] = []
     seen_lb: set[str] = set()
     seen_mic: set[str] = set()
+    log = logging.getLogger("overlay.audio")
 
     # --- 1) pyaudiowpatch WASAPI loopback (best on Windows) ---
     try:
@@ -292,105 +376,218 @@ def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
             wasapi = None
             try:
                 wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-            except Exception:
+            except Exception as exc:
+                log.warning("WASAPI host unavailable: %s", exc)
                 wasapi = None
 
             default_out_name = ""
+            default_out_index: int | None = None
             if wasapi is not None:
                 try:
-                    di = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
-                    default_out_name = di.get("name") or ""
+                    di = p.get_default_wasapi_device(d_out=True)
+                    default_out_name = (di.get("name") or "").strip()
+                    default_out_index = int(di["index"])
                 except Exception:
-                    pass
+                    try:
+                        default_out_index = int(wasapi["defaultOutputDevice"])
+                        di = p.get_device_info_by_index(default_out_index)
+                        default_out_name = (di.get("name") or "").strip()
+                    except Exception as exc:
+                        log.warning("default WASAPI output: %s", exc)
 
+            # Official helpers: default loopback + all loopback endpoints
+            try:
+                for info in p.get_loopback_device_info_generator():
+                    idx = int(info["index"])
+                    name = info.get("name") or f"loopback-{idx}"
+                    _add_loopback(
+                        loopbacks,
+                        seen_lb,
+                        key=f"paw-lb-{idx}",
+                        name=name,
+                        label=f"系统 · {name} (WASAPI)",
+                        backend="pyaudiowpatch",
+                        backend_ref=idx,
+                        default_out_name=default_out_name,
+                    )
+            except Exception as exc:
+                log.warning("loopback generator: %s", exc)
+
+            try:
+                info = p.get_default_wasapi_loopback()
+                idx = int(info["index"])
+                name = info.get("name") or f"loopback-{idx}"
+                _add_loopback(
+                    loopbacks,
+                    seen_lb,
+                    key=f"paw-lb-{idx}",
+                    name=name,
+                    label=f"系统 · {name} (WASAPI)",
+                    backend="pyaudiowpatch",
+                    backend_ref=idx,
+                    default_out_name=default_out_name or _strip_loopback_suffix(name),
+                )
+            except Exception as exc:
+                log.info("get_default_wasapi_loopback: %s", exc)
+
+            # Walk EVERY WASAPI render endpoint → analogue loopback
+            # (covers headphones / USB / secondary speakers after plug-in)
+            if wasapi is not None:
+                wasapi_index = int(wasapi["index"])
+                for i in range(p.get_device_count()):
+                    try:
+                        info = p.get_device_info_by_index(i)
+                    except Exception:
+                        continue
+                    if int(info.get("hostApi", -1)) != wasapi_index:
+                        continue
+                    if info.get("isLoopbackDevice"):
+                        continue
+                    if int(info.get("maxOutputChannels") or 0) <= 0:
+                        continue
+                    try:
+                        lb = p.get_wasapi_loopback_analogue_by_dict(info)
+                    except Exception:
+                        try:
+                            lb = p.get_wasapi_loopback_analogue_by_index(i)
+                        except Exception:
+                            continue
+                    idx = int(lb["index"])
+                    name = lb.get("name") or f"loopback-{idx}"
+                    _add_loopback(
+                        loopbacks,
+                        seen_lb,
+                        key=f"paw-lb-{idx}",
+                        name=name,
+                        label=f"系统 · {name} (WASAPI)",
+                        backend="pyaudiowpatch",
+                        backend_ref=idx,
+                        default_out_name=default_out_name,
+                    )
+
+            # Fallback scan: any device flagged isLoopbackDevice
             for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
+                try:
+                    info = p.get_device_info_by_index(i)
+                except Exception:
+                    continue
                 name = info.get("name") or f"device-{i}"
                 if info.get("isLoopbackDevice"):
-                    key = f"paw-lb-{i}"
-                    if key in seen_lb:
-                        continue
-                    seen_lb.add(key)
-                    score_prefix = ""
-                    if default_out_name and (
-                        default_out_name in name
-                        or name.replace(" [Loopback]", "") == default_out_name
-                    ):
-                        score_prefix = "★ "
-                    loopbacks.append(
-                        AudioDevice(
-                            key=key,
-                            label=f"{score_prefix}系统 · {name} (WASAPI)",
-                            kind="loopback",
-                            backend="pyaudiowpatch",
-                            backend_ref=int(info["index"]),
-                        )
+                    idx = int(info.get("index", i))
+                    _add_loopback(
+                        loopbacks,
+                        seen_lb,
+                        key=f"paw-lb-{idx}",
+                        name=name,
+                        label=f"系统 · {name} (WASAPI)",
+                        backend="pyaudiowpatch",
+                        backend_ref=idx,
+                        default_out_name=default_out_name,
                     )
                 elif int(info.get("maxInputChannels") or 0) > 0 and not info.get(
                     "isLoopbackDevice"
                 ):
-                    # Skip mapper / generic duplicates somewhat
                     if "mapper" in name.lower() or "主声音捕获" in name:
                         continue
-                    key = f"paw-mic-{i}"
                     if name in seen_mic:
                         continue
                     seen_mic.add(name)
                     mics.append(
                         AudioDevice(
-                            key=key,
+                            key=f"paw-mic-{i}",
                             label=f"麦克风 · {name}",
                             kind="mic",
                             backend="pyaudiowpatch",
                             backend_ref=int(info["index"]),
+                            device_name=name,
                         )
                     )
+
+            # Ensure the ★ marker lands on current default even if name matching
+            # was fuzzy (e.g. Realtek speakers vs headphones share branding).
+            if default_out_name and loopbacks:
+                for d in loopbacks:
+                    if d.backend != "pyaudiowpatch":
+                        continue
+                    if _names_match_output(d.device_name, default_out_name):
+                        if not d.label.startswith("★ "):
+                            d.label = "★ " + d.label
+                    elif d.label.startswith("★ ") and not _names_match_output(
+                        d.device_name, default_out_name
+                    ):
+                        d.label = d.label[2:]
+
+            if default_out_index is not None and not any(
+                d.label.startswith("★ ") for d in loopbacks
+            ):
+                try:
+                    lb = p.get_wasapi_loopback_analogue_by_index(default_out_index)
+                    idx = int(lb["index"])
+                    name = lb.get("name") or f"loopback-{idx}"
+                    _add_loopback(
+                        loopbacks,
+                        seen_lb,
+                        key=f"paw-lb-{idx}",
+                        name=name,
+                        label=f"系统 · {name} (WASAPI)",
+                        backend="pyaudiowpatch",
+                        backend_ref=idx,
+                        default_out_name=name,  # force ★
+                    )
+                except Exception as exc:
+                    log.info("analogue for default out idx %s: %s", default_out_index, exc)
         finally:
             p.terminate()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("pyaudiowpatch enumerate failed: %s", exc)
 
-    # --- 2) soundcard loopback / mics ---
+    # --- 2) soundcard: loopback for default + ALL speakers ---
     try:
         import soundcard as sc
 
+        default_sp_name = ""
         try:
-            sp = sc.default_speaker()
-            lb = sc.get_microphone(id=str(sp.name), include_loopback=True)
-            key = f"sc-lb-{sp.name}"
-            if key not in seen_lb and getattr(lb, "isloopback", True):
-                seen_lb.add(key)
-                # Avoid duplicate if we already have WASAPI for same name
-                if not any(sp.name in d.label for d in loopbacks):
-                    loopbacks.append(
-                        AudioDevice(
-                            key=key,
-                            label=f"系统 · {sp.name} (soundcard loopback)",
-                            kind="loopback",
-                            backend="soundcard",
-                            backend_ref=lb,
-                        )
-                    )
+            default_sp_name = sc.default_speaker().name or ""
         except Exception:
             pass
+
+        speakers = []
+        try:
+            speakers = list(sc.all_speakers())
+        except Exception as exc:
+            log.warning("soundcard all_speakers: %s", exc)
+
+        for sp in speakers:
+            try:
+                lb = sc.get_microphone(id=str(sp.name), include_loopback=True)
+            except Exception:
+                continue
+            if not getattr(lb, "isloopback", True):
+                continue
+            name = getattr(lb, "name", None) or sp.name
+            _add_loopback(
+                loopbacks,
+                seen_lb,
+                key=f"sc-lb-{sp.name}",
+                name=name,
+                label=f"系统 · {name} (soundcard loopback)",
+                backend="soundcard",
+                backend_ref=lb,
+                default_out_name=default_sp_name,
+            )
 
         for mic in sc.all_microphones(include_loopback=True):
             name = mic.name
             if getattr(mic, "isloopback", False) or _name_looks_loopback(name):
-                key = f"sc-lb-{name}"
-                if key in seen_lb:
-                    continue
-                if any(name in d.label for d in loopbacks):
-                    continue
-                seen_lb.add(key)
-                loopbacks.append(
-                    AudioDevice(
-                        key=key,
-                        label=f"系统 · {name} (soundcard)",
-                        kind="loopback",
-                        backend="soundcard",
-                        backend_ref=mic,
-                    )
+                _add_loopback(
+                    loopbacks,
+                    seen_lb,
+                    key=f"sc-lb-{name}",
+                    name=name,
+                    label=f"系统 · {name} (soundcard)",
+                    backend="soundcard",
+                    backend_ref=mic,
+                    default_out_name=default_sp_name,
                 )
             else:
                 if name in seen_mic:
@@ -403,10 +600,11 @@ def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
                         kind="mic",
                         backend="soundcard",
                         backend_ref=mic,
+                        device_name=name,
                     )
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("soundcard enumerate failed: %s", exc)
 
     # --- 3) sounddevice named Stereo Mix / Cable / etc. ---
     try:
@@ -423,31 +621,24 @@ def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
                 host_name = hostapis[int(d["hostapi"])]["name"]
             except Exception:
                 pass
-            # Skip WDM-KS for sounddevice blocking I/O (often unsupported)
             if "WDM-KS" in host_name:
                 continue
             if _name_looks_loopback(name):
-                key = f"sd-lb-{i}"
-                if any(name.split("(")[0].strip() in x.label for x in loopbacks):
-                    continue
-                if key in seen_lb:
-                    continue
-                seen_lb.add(key)
-                loopbacks.append(
-                    AudioDevice(
-                        key=key,
-                        label=f"系统 · {name} ({host_name or 'sounddevice'})",
-                        kind="loopback",
-                        backend="sounddevice",
-                        backend_ref=i,
-                    )
+                _add_loopback(
+                    loopbacks,
+                    seen_lb,
+                    key=f"sd-lb-{i}",
+                    name=name,
+                    label=f"系统 · {name} ({host_name or 'sounddevice'})",
+                    backend="sounddevice",
+                    backend_ref=i,
+                    default_out_name="",
                 )
             else:
                 if "mapper" in name.lower() or "主声音捕获" in name:
                     continue
                 if name in seen_mic:
                     continue
-                # Prefer WASAPI / MME mics only if we have none yet from other backends
                 if not mics or "WASAPI" in host_name or host_name.startswith("MME"):
                     seen_mic.add(name)
                     mics.append(
@@ -457,26 +648,95 @@ def list_audio_devices() -> tuple[list[AudioDevice], list[AudioDevice]]:
                             kind="mic",
                             backend="sounddevice",
                             backend_ref=i,
+                            device_name=name,
                         )
                     )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("sounddevice enumerate failed: %s", exc)
 
-    # Sort: starred / default speakers first among loopbacks
     loopbacks.sort(key=lambda d: (0 if d.label.startswith("★") else 1, d.label))
+    log.info(
+        "enumerated %d loopback(s), %d mic(s); default_playback=%r",
+        len(loopbacks),
+        len(mics),
+        current_default_playback_name(),
+    )
     return loopbacks, mics
 
 
 def pick_default_loopback(loopbacks: list[AudioDevice]) -> Optional[AudioDevice]:
+    """Prefer ★ (current default playback) WASAPI loopback."""
     if not loopbacks:
         return None
     for d in loopbacks:
         if d.label.startswith("★"):
             return d
+    # Re-check against live default name (in case ★ marking missed)
+    default_name = current_default_playback_name()
+    if default_name:
+        for d in loopbacks:
+            if _names_match_output(d.device_name, default_name):
+                return d
     for d in loopbacks:
         if d.backend == "pyaudiowpatch":
             return d
     return loopbacks[0]
+
+
+def resolve_pyaudiowpatch_loopback_index(device: AudioDevice) -> int:
+    """Re-resolve WASAPI loopback index by name (indices shift after plug-in)."""
+    import pyaudiowpatch as pyaudio
+
+    preferred = int(device.backend_ref)
+    want = _strip_loopback_suffix(device.device_name)
+    p = pyaudio.PyAudio()
+    try:
+        # Prefer current default playback's loopback when this device was ★ / default
+        if device.label.startswith("★") or not want:
+            try:
+                info = p.get_default_wasapi_loopback()
+                return int(info["index"])
+            except Exception:
+                pass
+        if want:
+            for info in p.get_loopback_device_info_generator():
+                if _names_match_output(info.get("name") or "", want):
+                    return int(info["index"])
+            # Match against current outputs' analogues
+            try:
+                wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                for i in range(p.get_device_count()):
+                    info = p.get_device_info_by_index(i)
+                    if int(info.get("hostApi", -1)) != int(wasapi["index"]):
+                        continue
+                    if int(info.get("maxOutputChannels") or 0) <= 0:
+                        continue
+                    if info.get("isLoopbackDevice"):
+                        continue
+                    if not _names_match_output(
+                        (info.get("name") or "") + " [Loopback]", want
+                    ) and not _names_match_output(info.get("name") or "", want):
+                        continue
+                    try:
+                        lb = p.get_wasapi_loopback_analogue_by_dict(info)
+                        return int(lb["index"])
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        # Last resort: stored index if still a loopback
+        try:
+            info = p.get_device_info_by_index(preferred)
+            if info.get("isLoopbackDevice"):
+                return preferred
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"找不到回环设备「{device.device_name or preferred}」。"
+            "请点「刷新设备」后重试（插拔耳机后索引会变化）。"
+        )
+    finally:
+        p.terminate()
 
 
 # ---------------------------------------------------------------------------
@@ -520,8 +780,12 @@ class CaptureSession:
     def _start_pyaudiowpatch(self) -> int:
         import pyaudiowpatch as pyaudio
 
+        # Re-resolve index: plugging headphones shifts PortAudio device indices.
+        if self.device.kind == "loopback":
+            idx = resolve_pyaudiowpatch_loopback_index(self.device)
+        else:
+            idx = int(self.device.backend_ref)
         p = pyaudio.PyAudio()
-        idx = int(self.device.backend_ref)
         info = p.get_device_info_by_index(idx)
         sr = int(info.get("defaultSampleRate") or 48000)
         ch = max(1, int(info.get("maxInputChannels") or 2))
@@ -944,9 +1208,16 @@ class OverlayWindow(QWidget):
             load_settings(BASE_DIR).get(FIELD_OVERLAY_OPACITY)
         )
 
+        self._last_default_playback = current_default_playback_name()
         self._refresh_devices(show_help_if_empty=True)
         self._sync_model_banner()
         self._apply_overlay_opacity(self._overlay_opacity)
+
+        # Plug/unplug headphones → Windows default playback changes; refresh list.
+        self._device_poll = QTimer(self)
+        self._device_poll.setInterval(2500)
+        self._device_poll.timeout.connect(self._poll_default_playback)
+        self._device_poll.start()
 
         cfg = self.client.check()
         if cfg:
@@ -1358,33 +1629,105 @@ class OverlayWindow(QWidget):
         return self.source_combo.currentData() or "loopback"
 
     def _refresh_devices(self, show_help_if_empty: bool = False) -> None:
+        prev_key = ""
+        try:
+            prev_key = self.device_combo.currentData() or ""
+        except Exception:
+            prev_key = ""
+        self._last_default_playback = current_default_playback_name()
         self._loopbacks, self._mics = list_audio_devices()
         self._devices_by_key = {d.key: d for d in self._loopbacks + self._mics}
-        self._fill_device_combo()
+        self._fill_device_combo(prefer_key=prev_key)
+        if self._source_mode() == "loopback" and self._loopbacks:
+            picked = pick_default_loopback(self._loopbacks)
+            tip = f"已刷新 · 默认播放「{self._last_default_playback or '?'}」"
+            if picked:
+                tip += f" → {picked.device_name or picked.label}"
+            self.status_lbl.setText(tip)
         if show_help_if_empty and self._source_mode() == "loopback" and not self._loopbacks:
-            self.status_lbl.setText("未找到系统回环设备")
+            self.status_lbl.setText("未找到系统回环设备（插耳机后请再点刷新）")
             QMessageBox.warning(self, "需要系统声音回环", NO_LOOPBACK_HELP)
 
-    def _fill_device_combo(self) -> None:
+    def _fill_device_combo(self, prefer_key: str = "") -> None:
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
         mode = self._source_mode()
         devices = self._loopbacks if mode == "loopback" else self._mics
         if not devices:
             if mode == "loopback":
-                self.device_combo.addItem("（无回环设备 — 点刷新或看帮助）", "")
+                self.device_combo.addItem("（无回环设备 — 插耳机后点刷新）", "")
             else:
                 self.device_combo.addItem("（未检测到麦克风）", "")
         else:
             for d in devices:
                 self.device_combo.addItem(d.label, d.key)
             if mode == "loopback":
+                # Prefer current default (★); else keep prior selection if still present
                 default = pick_default_loopback(devices)
+                chosen = None
                 if default:
-                    idx = self.device_combo.findData(default.key)
+                    chosen = default.key
+                elif prefer_key and self.device_combo.findData(prefer_key) >= 0:
+                    chosen = prefer_key
+                if chosen:
+                    idx = self.device_combo.findData(chosen)
                     if idx >= 0:
                         self.device_combo.setCurrentIndex(idx)
+            elif prefer_key:
+                idx = self.device_combo.findData(prefer_key)
+                if idx >= 0:
+                    self.device_combo.setCurrentIndex(idx)
         self.device_combo.blockSignals(False)
+
+    def _poll_default_playback(self) -> None:
+        """When headphones plug in, default playback switches — refresh combo."""
+        try:
+            name = current_default_playback_name()
+        except Exception:
+            return
+        if not name or name == getattr(self, "_last_default_playback", None):
+            return
+        prev = self._last_default_playback
+        self._last_default_playback = name
+        logging.getLogger("overlay.audio").info(
+            "default playback changed: %r -> %r", prev, name
+        )
+        was_recording = self._recording
+        if was_recording:
+            self.worker.stop()
+            self._recording = False
+            self.btn_toggle.setText("开始")
+            self.btn_toggle.setStyleSheet(self._btn_style("#2d8f4e"))
+        self._refresh_devices(show_help_if_empty=False)
+        if self._source_mode() != "loopback":
+            self.status_lbl.setText(f"播放设备已切换为「{name}」")
+            return
+        if not self._loopbacks:
+            self.status_lbl.setText(
+                f"播放设备已切换为「{name}」，但未找到回环 — 可点刷新或看帮助"
+            )
+            QMessageBox.warning(self, "需要系统声音回环", NO_LOOPBACK_HELP)
+            return
+        default = pick_default_loopback(self._loopbacks)
+        if default:
+            idx = self.device_combo.findData(default.key)
+            if idx >= 0:
+                self.device_combo.setCurrentIndex(idx)
+        if was_recording and default is not None:
+            try:
+                self.worker.start(default)
+                self._recording = True
+                self.btn_toggle.setText("停止")
+                self.btn_toggle.setStyleSheet(self._btn_style("#c45c26"))
+                self.status_lbl.setText(
+                    f"已切换到「{name}」回环并继续字幕 · {default.label}"
+                )
+            except Exception as exc:
+                self.status_lbl.setText(f"切换回环失败：{exc}（请点刷新后重试）")
+        else:
+            self.status_lbl.setText(
+                f"检测到播放设备切换为「{name}」，已选对应回环 — 请点「开始」"
+            )
 
     def _on_source_mode_changed(self, _index: int = 0) -> None:
         if self._recording:
@@ -1554,9 +1897,22 @@ class OverlayWindow(QWidget):
             self.status_lbl.setText(err)
             return
 
-        if self._source_mode() == "loopback" and not self._loopbacks:
-            QMessageBox.warning(self, "需要系统声音回环", NO_LOOPBACK_HELP)
-            return
+        if self._source_mode() == "loopback":
+            # Re-enumerate so headphones-as-default is available before capture
+            prev_key = self.device_combo.currentData() or ""
+            self._refresh_devices(show_help_if_empty=False)
+            if not self._loopbacks:
+                QMessageBox.warning(self, "需要系统声音回环", NO_LOOPBACK_HELP)
+                return
+            # Keep manual pick if still listed; otherwise ★ current default playback
+            if prev_key and self.device_combo.findData(prev_key) >= 0:
+                self.device_combo.setCurrentIndex(self.device_combo.findData(prev_key))
+            else:
+                default = pick_default_loopback(self._loopbacks)
+                if default:
+                    idx = self.device_combo.findData(default.key)
+                    if idx >= 0:
+                        self.device_combo.setCurrentIndex(idx)
 
         device = self._selected_device()
         if device is None:
